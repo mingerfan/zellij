@@ -1,6 +1,6 @@
 use super::super::{
-    CharacterChunk, FloatingPanesStack, HostKittyState, KittyImageChunk, Output, OutputBuffer,
-    SixelImageChunk,
+    CharacterChunk, FloatingPanesStack, HostKittyState, KittyFrameInput, KittyImageChunk, Output,
+    OutputBuffer, SixelImageChunk,
 };
 use crate::panes::kitty_graphics::parser::{
     DecodedImage, KittyAction, KittyCommandParser, KittyFormat,
@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use zellij_utils::pane_size::{Dimension, PaneGeom, Size, SizeInPixels};
+use zellij_utils::structured_render::{decode, FrameBuilder, GraphicsRecord};
 
 /// Helper to create a simple Output instance for testing
 fn create_test_output() -> Output {
@@ -65,6 +66,128 @@ fn create_pane_geom(x: usize, y: usize, cols: usize, rows: usize) -> PaneGeom {
         is_pinned: false,
         logical_position: None,
     }
+}
+
+#[test]
+fn kitty_placeholder_glyphs_are_blanked_in_both_text_serialization_paths() {
+    use crate::panes::kitty_graphics::PLACEHOLDER_CHAR;
+    for grouped in [false, true] {
+        let mut placeholder = TerminalCharacter::new(PLACEHOLDER_CHAR);
+        assert!(placeholder.attach('\u{305}'));
+        assert!(placeholder.attach('\u{30d}'));
+        let mut accented = TerminalCharacter::new('e');
+        assert!(accented.attach('\u{301}'));
+        let mut chunk = CharacterChunk::new(
+            vec![placeholder, TerminalCharacter::new('\u{100000}'), accented],
+            0,
+            0,
+        );
+        chunk.may_have_groups = grouped;
+        let output =
+            super::super::serialize_chunks(vec![chunk], None, None, None, true, true, None, None)
+                .unwrap();
+        assert!(!output.contains(PLACEHOLDER_CHAR));
+        assert!(!output.contains('\u{305}'));
+        assert!(
+            output.contains('\u{100000}'),
+            "unrelated private-use text is preserved"
+        );
+        assert!(output.contains("e\u{301}"));
+    }
+}
+
+fn structured_frame(
+    chunks: Vec<CharacterChunk>,
+    kitty_input: Option<KittyFrameInput<'_>>,
+) -> Vec<u8> {
+    let mut builder = FrameBuilder::new(80, 24, 0);
+    super::super::flatten_chunks(
+        chunks,
+        None,
+        None,
+        true,
+        kitty_input,
+        None,
+        &mut builder,
+        None,
+    )
+    .unwrap();
+    builder.finish()
+}
+
+#[test]
+fn structured_placeholders_are_single_blanks_and_never_enter_the_cluster_table() {
+    use crate::panes::kitty_graphics::PLACEHOLDER_CHAR;
+    for grouped in [false, true] {
+        for attached in [false, true] {
+            let mut placeholder = TerminalCharacter::new(PLACEHOLDER_CHAR);
+            if attached {
+                assert!(placeholder.attach('\u{305}'));
+                assert!(placeholder.attach('\u{30d}'));
+            }
+            let mut accented = TerminalCharacter::new('e');
+            assert!(accented.attach('\u{301}'));
+            let mut chunk = CharacterChunk::new(
+                vec![
+                    TerminalCharacter::new('a'),
+                    placeholder,
+                    TerminalCharacter::new('\u{100000}'),
+                    accented,
+                    TerminalCharacter::new('z'),
+                ],
+                0,
+                0,
+            );
+            chunk.may_have_groups = grouped;
+            let frame = structured_frame(vec![chunk], None);
+            let view = decode(&frame).unwrap();
+            let clusters = view.clusters();
+            let (_, cells) = view.rows().next().unwrap();
+            assert_eq!(cells.len(), 5, "grouped={grouped}, attached={attached}");
+            assert!(cells.iter().all(|cell| cell.width == 1));
+            assert_eq!(cells[0].character(), 'a');
+            assert_eq!(cells[1].character(), ' ');
+            assert!(cells[1].cluster_id().is_none());
+            assert!(!cells[1].is_group_continuation());
+            assert_eq!(cells[2].character(), '\u{100000}');
+            assert_eq!(cells[3].text(&clusters), "e\u{301}");
+            assert_eq!(cells[4].character(), 'z');
+            assert_eq!(clusters.entries.len(), 1);
+            assert_eq!(clusters.entries[0].text, "e\u{301}");
+        }
+    }
+}
+
+#[test]
+fn structured_placeholders_do_not_join_a_preceding_grapheme_group() {
+    use crate::panes::kitty_graphics::PLACEHOLDER_CHAR;
+    let mut placeholder = TerminalCharacter::new(PLACEHOLDER_CHAR);
+    assert!(placeholder.attach('\u{305}'));
+    assert!(placeholder.attach('\u{30d}'));
+    // Unicode Prepend would otherwise group with the placeholder to its right.
+    let prepend = TerminalCharacter::from_cluster("\u{600}", 1, Default::default()).unwrap();
+    let chunk = grouped_chunk(vec![prepend, placeholder], 0, 0);
+    let ansi = super::super::serialize_chunks(
+        vec![chunk.clone()],
+        None,
+        None,
+        None,
+        true,
+        true,
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(!ansi.contains(PLACEHOLDER_CHAR));
+    assert!(!ansi.contains('\u{305}'));
+    let frame = structured_frame(vec![chunk], None);
+    let view = decode(&frame).unwrap();
+    let (_, cells) = view.rows().next().unwrap();
+    assert_eq!(cells.len(), 2);
+    assert_eq!(cells[1].character(), ' ');
+    assert_eq!(cells[1].width, 1);
+    assert!(!cells[1].is_group_continuation());
+    assert!(view.clusters().is_empty());
 }
 
 #[test]
@@ -1629,6 +1752,149 @@ fn parse_kitty_placement_crops(output: &str) -> Vec<(usize, usize, usize, usize,
     crops
 }
 
+fn kitty_variant_replacement_chunks(parts: &KittyTestParts) -> [KittyImageChunk; 2] {
+    let internal = store_test_kitty_image(&parts.0, 30, 40);
+    [(20, 40), (30, 60)].map(|size| {
+        let key = ScaledImageKey {
+            source: PixelRect {
+                x: 0,
+                y: 0,
+                width: 30,
+                height: 40,
+            },
+            size,
+            fit: true,
+        };
+        parts
+            .0
+            .borrow_mut()
+            .add_scaled_variant(internal, key, vec![255; size.0 * size.1 * 4]);
+        let mut chunk = kitty_chunk(internal, 42, 0, 0);
+        chunk.scaled_image = Some(key);
+        chunk.source_px_width = size.0;
+        chunk.source_px_height = size.1;
+        chunk
+    })
+}
+
+fn run_structured_kitty_frame(
+    parts: &KittyTestParts,
+    chunks: Vec<KittyImageChunk>,
+) -> Vec<GraphicsRecord> {
+    let mut store = parts.0.borrow_mut();
+    let mut states = parts.2.borrow_mut();
+    let frame = structured_frame(
+        vec![],
+        Some(KittyFrameInput {
+            chunks_by_pane: HashMap::from([(PaneId::Terminal(1), chunks)]),
+            rendered_panes: HashSet::from([PaneId::Terminal(1)]),
+            visible_panes: None,
+            kitty_image_store: &mut store,
+            host_state: states.entry(1).or_default(),
+            host_display_cleared: false,
+            compressed: false,
+            local_media: false,
+        }),
+    );
+    decode(&frame).unwrap().graphics()
+}
+
+#[test]
+fn kitty_variant_replacement_deletes_the_old_image_local_placement() {
+    let parts = create_test_kitty_parts();
+    let [first, second] = kitty_variant_replacement_chunks(&parts);
+    let frame_a = run_kitty_frame(&parts, vec![first], None);
+    let frame_b = run_kitty_frame(&parts, vec![second], None);
+    let frame_c = run_kitty_frame(&parts, vec![], None);
+    let mut placed = HashSet::new();
+    let mut updates_by_frame = Vec::new();
+    for (frame, expected_live) in [(frame_a, 1), (frame_b, 1), (frame_c, 0)] {
+        let mut updates = Vec::new();
+        let mut parser = KittyCommandParser::new();
+        for raw in extract_kitty_commands(&frame) {
+            let Some(command) = parser.parse(&raw) else {
+                continue;
+            };
+            let command = command.unwrap();
+            if let Some(placement_id) = command.placement_id {
+                let tuple = (command.image_id.unwrap(), placement_id);
+                match command.action {
+                    KittyAction::Display => {
+                        placed.insert(tuple);
+                    },
+                    KittyAction::Delete => {
+                        assert_eq!(command.delete_specifier, Some('i'));
+                        assert!(placed.remove(&tuple));
+                    },
+                    _ => panic!("unexpected placement command: {:?}", command),
+                }
+                updates.push((command.action, tuple));
+            }
+        }
+        assert_eq!(placed.len(), expected_live);
+        updates_by_frame.push(updates);
+    }
+    let old = updates_by_frame[0][0].1;
+    let new = updates_by_frame[1].last().unwrap().1;
+    assert_ne!(old.0, new.0, "a new scaled variant has a new host image id");
+    assert_eq!(old.1, new.1, "the same uid reuses the placement id");
+    assert_eq!(
+        updates_by_frame[1],
+        vec![(KittyAction::Delete, old), (KittyAction::Display, new)]
+    );
+    assert_eq!(updates_by_frame[2], vec![(KittyAction::Delete, new)]);
+    assert!(parts.2.borrow()[&1].live_placements.is_empty());
+}
+
+#[test]
+fn structured_kitty_variant_replacement_deletes_the_old_image_local_placement() {
+    let parts = create_test_kitty_parts();
+    let [first, second] = kitty_variant_replacement_chunks(&parts);
+    let frame_a = run_structured_kitty_frame(&parts, vec![first]);
+    let frame_b = run_structured_kitty_frame(&parts, vec![second]);
+    let frame_c = run_structured_kitty_frame(&parts, vec![]);
+    let mut placed = HashSet::new();
+    let mut updates_by_frame = Vec::new();
+    for (frame, expected_live) in [(frame_a, 1), (frame_b, 1), (frame_c, 0)] {
+        let mut updates = Vec::new();
+        for record in frame {
+            match record {
+                GraphicsRecord::Placement {
+                    image_id,
+                    placement_id,
+                    ..
+                } => {
+                    let tuple = (image_id, placement_id);
+                    placed.insert(tuple);
+                    updates.push((KittyAction::Display, tuple));
+                },
+                GraphicsRecord::DeletePlacement {
+                    image_id,
+                    placement_id,
+                } => {
+                    let tuple = (image_id, placement_id);
+                    assert!(placed.remove(&tuple));
+                    updates.push((KittyAction::Delete, tuple));
+                },
+                GraphicsRecord::Residency { .. } => {},
+                other => panic!("unexpected graphics record: {:?}", other),
+            }
+        }
+        assert_eq!(placed.len(), expected_live);
+        updates_by_frame.push(updates);
+    }
+    let old = updates_by_frame[0][0].1;
+    let new = updates_by_frame[1].last().unwrap().1;
+    assert_ne!(old.0, new.0);
+    assert_eq!(old.1, new.1);
+    assert_eq!(
+        updates_by_frame[1],
+        vec![(KittyAction::Delete, old), (KittyAction::Display, new)]
+    );
+    assert_eq!(updates_by_frame[2], vec![(KittyAction::Delete, new)]);
+    assert!(parts.2.borrow()[&1].live_placements.is_empty());
+}
+
 #[test]
 fn kitty_transmit_only_once_across_frames() {
     let parts = create_test_kitty_parts();
@@ -1703,6 +1969,7 @@ fn kitty_local_media_carries_the_scaled_variant_when_the_chunk_names_one() {
             height: 40,
         },
         size: (20, 30),
+        fit: false,
     };
     parts
         .0

@@ -7305,6 +7305,9 @@ fn build_three_kitty_placements(
     assert_eq!(grid.kitty_placement_count(), 3);
 }
 
+#[path = "./kitty_placeholder_tests.rs"]
+mod kitty_placeholder_tests;
+
 #[test]
 fn kitty_transmit_and_display_raw_rgb() {
     let (mut grid, kitty_image_store) = new_kitty_grid(20, 40);
@@ -7383,6 +7386,90 @@ fn kitty_cursor_unmoved_with_c1() {
     );
     let (cursor_x, cursor_y, _) = grid.cursor_coordinates().unwrap();
     assert_eq!((cursor_x, cursor_y), (0, 0));
+}
+
+#[test]
+fn kitty_placeholder_diacritic_sequence_is_invalidated_by_cursor_reposition() {
+    use crate::panes::kitty_graphics::PLACEHOLDER_CHAR;
+    let (mut grid, _kitty_image_store) = new_kitty_grid(10, 10);
+    let mut vte_parser = vt_parser::Parser::new();
+    let mut interceptor = KittyApcInterceptor::new();
+    // print a lone placeholder cell at (0, 0) with no diacritics yet - this arms
+    // pending_kitty_placeholder for (x: 0, y: 0), waiting at cursor (1, 0)
+    feed_kitty_bytes(
+        &mut grid,
+        &mut vte_parser,
+        &mut interceptor,
+        PLACEHOLDER_CHAR.to_string().as_bytes(),
+    );
+    let placeholder_char_before = grid.viewport[0].columns[0].character;
+    assert_eq!(placeholder_char_before, PLACEHOLDER_CHAR);
+    // CSI H repositions the cursor directly back to (1, 0) without printing
+    // anything - this must not leave pending_kitty_placeholder armed, or a
+    // real combining mark printed next would be folded into the placeholder
+    // cell's stored row/column/id-msb instead of being dropped as ordinary
+    // (if unsupported) zero-width text
+    feed_kitty_bytes(&mut grid, &mut vte_parser, &mut interceptor, b"\x1b[1;2H");
+    assert_eq!(grid.pending_kitty_placeholder, None);
+    // U+0305 is a real Unicode combining mark that also happens to be the
+    // first entry in the kitty row/column diacritic table
+    feed_kitty_bytes(
+        &mut grid,
+        &mut vte_parser,
+        &mut interceptor,
+        '\u{0305}'.to_string().as_bytes(),
+    );
+    assert_eq!(
+        grid.viewport[0].columns[0].character, placeholder_char_before,
+        "a stray combining mark after an unrelated cursor reposition must not mutate the earlier placeholder cell"
+    );
+}
+
+#[test]
+fn kitty_placeholder_diacritic_sequence_is_invalidated_by_alternate_screen_switch() {
+    use crate::panes::kitty_graphics::PLACEHOLDER_CHAR;
+    let (mut grid, _kitty_image_store) = new_kitty_grid(10, 10);
+    let mut vte_parser = vt_parser::Parser::new();
+    let mut interceptor = KittyApcInterceptor::new();
+    feed_kitty_bytes(
+        &mut grid,
+        &mut vte_parser,
+        &mut interceptor,
+        PLACEHOLDER_CHAR.to_string().as_bytes(),
+    );
+    let placeholder_char_before = grid.viewport[0].columns[0].character;
+    // enter the alternate screen, then leave it - on return the cursor is
+    // restored to (1, 0), the exact position pending_kitty_placeholder was
+    // waiting at, even though a whole screen swap happened in between
+    feed_kitty_bytes(&mut grid, &mut vte_parser, &mut interceptor, b"\x1b[?1049h");
+    feed_kitty_bytes(&mut grid, &mut vte_parser, &mut interceptor, b"\x1b[?1049l");
+    assert_eq!(grid.pending_kitty_placeholder, None);
+    feed_kitty_bytes(
+        &mut grid,
+        &mut vte_parser,
+        &mut interceptor,
+        '\u{0305}'.to_string().as_bytes(),
+    );
+    assert_eq!(
+        grid.viewport[0].columns[0].character, placeholder_char_before,
+        "a stray combining mark after an alternate-screen round trip must not mutate the earlier placeholder cell"
+    );
+}
+
+#[test]
+fn kitty_placeholders_do_not_repurpose_unrelated_private_use_characters() {
+    let (mut grid, _store) = new_kitty_grid(10, 10);
+    let mut parser = vt_parser::Parser::new();
+    let mut interceptor = KittyApcInterceptor::new();
+    feed_kitty_bytes(
+        &mut grid,
+        &mut parser,
+        &mut interceptor,
+        "\u{100000}\u{10eedd}".as_bytes(),
+    );
+    assert_eq!(grid.viewport[0].columns[0].character, '\u{100000}');
+    assert_eq!(grid.viewport[0].columns[1].character, '\u{10eedd}');
+    assert!(grid.scan_placeholder_runs().is_empty());
 }
 
 #[test]

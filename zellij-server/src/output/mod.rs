@@ -6,6 +6,7 @@ use crate::panes::Row;
 use crate::panes::Selection;
 use crate::{
     panes::kitty_graphics::{
+        is_placeholder_character,
         store::{InternalImageId, KittyImageStore, ScaledImageKey},
         KittyHostCapability,
     },
@@ -225,7 +226,12 @@ fn serialize_chunks_with_newlines(
             )
             .with_context(err_context)?;
             chunk_width += t_character.width();
-            t_character.push_text_to(&mut vte_output);
+            // Image chunks paint placeholders; suppress their textual glyphs.
+            if crate::panes::kitty_graphics::is_placeholder_character(t_character.character) {
+                vte_output.push(' ');
+            } else {
+                t_character.push_text_to(&mut vte_output);
+            }
         }
     }
     Ok(vte_output)
@@ -456,7 +462,17 @@ fn flatten_kitty_frame(kitty_input: KittyFrameInput, out: &mut Vec<GraphicsRecor
                 {
                     continue;
                 },
-                Some((host_placement_id, _, _)) => host_placement_id,
+                Some((host_placement_id, _, existing_host_image_id)) => {
+                    // Placement ids are image-local: reusing p on another image
+                    // does not replace the previous (image, p) tuple.
+                    if existing_host_image_id != host_image_id {
+                        out.push(GraphicsRecord::DeletePlacement {
+                            image_id: existing_host_image_id as u64,
+                            placement_id: host_placement_id as u64,
+                        });
+                    }
+                    host_placement_id
+                },
                 None => {
                     let host_placement_id = host_state.next_host_placement_id;
                     host_state.next_host_placement_id += 1;
@@ -695,6 +711,30 @@ fn flatten_chunks(
         let mut index = 0;
         while index < cells.len() {
             let t_character = &cells[index];
+            if is_placeholder_character(t_character.character) {
+                if chunk_width + 1 > cols {
+                    break;
+                }
+                // Image records paint this cell. Never intern its attached
+                // coordinate marks or expose them to structured text clients.
+                let mut cell = wire_cell(
+                    t_character,
+                    styles_at(t_character, chunk_width),
+                    chunk_changed_colors,
+                    styled_underlines,
+                );
+                cell.ch = ' ' as u32;
+                cell.width = 1;
+                if let Some(links) = links.as_deref_mut() {
+                    if let Some(uri) = links.handler.uri(t_character.styles.link_anchor) {
+                        cell.link = links.table.id_for(uri, cols, rows);
+                    }
+                }
+                chunk_width += 1;
+                run.push(cell);
+                index += 1;
+                continue;
+            }
             if t_character.width() == 0 {
                 index += 1;
                 continue;
@@ -745,8 +785,9 @@ fn flatten_chunks(
             }
             let unit_end = if character_chunk.may_have_groups {
                 grapheme_join::group_end(cells, index, |previous, next| {
-                    styles_at(&cells[previous], column_starts[previous])
-                        == styles_at(&cells[next], column_starts[next])
+                    !is_placeholder_character(cells[next].character)
+                        && styles_at(&cells[previous], column_starts[previous])
+                            == styles_at(&cells[next], column_starts[next])
                 })
             } else {
                 index + 1
@@ -986,7 +1027,9 @@ fn serialize_chunks(
                     &mut vte_output,
                 )
                 .with_context(err_context)?;
-                if t_character.has_attached() {
+                if crate::panes::kitty_graphics::is_placeholder_character(t_character.character) {
+                    vte_output.push(' ');
+                } else if t_character.has_attached() {
                     write_unit_text(
                         &mut vte_output,
                         std::slice::from_ref(t_character),
@@ -1026,8 +1069,9 @@ fn serialize_chunks(
         while index < cells.len() {
             let t_character = &cells[index];
             let unit_end = grapheme_join::group_end(cells, index, |previous, next| {
-                styles_at(&cells[previous], column_starts[previous])
-                    == styles_at(&cells[next], column_starts[next])
+                !crate::panes::kitty_graphics::is_placeholder_character(cells[next].character)
+                    && styles_at(&cells[previous], column_starts[previous])
+                        == styles_at(&cells[next], column_starts[next])
             });
             let unit = &cells[index..unit_end];
             let unit_columns: usize = unit.iter().map(|c| c.width()).sum();
@@ -1046,7 +1090,9 @@ fn serialize_chunks(
                 &mut vte_output,
             )
             .with_context(err_context)?;
-            if unit_end == index + 1 && !t_character.has_attached() {
+            if crate::panes::kitty_graphics::is_placeholder_character(t_character.character) {
+                vte_output.push(' ');
+            } else if unit_end == index + 1 && !t_character.has_attached() {
                 vte_output.push(t_character.character);
             } else {
                 write_unit_text(&mut vte_output, unit, unit_columns, chunk_width)
@@ -1463,7 +1509,17 @@ fn serialize_kitty_frame(kitty_input: KittyFrameInput) -> Result<String> {
                 {
                     continue;
                 },
-                Some((host_placement_id, _, _)) => host_placement_id,
+                Some((host_placement_id, _, existing_host_image_id)) => {
+                    if existing_host_image_id != host_image_id {
+                        write!(
+                            out,
+                            "\u{1b}_Ga=d,q=2,d=i,i={},p={}\u{1b}\\",
+                            existing_host_image_id, host_placement_id
+                        )
+                        .context(err_context)?;
+                    }
+                    host_placement_id
+                },
                 None => {
                     let host_placement_id = host_state.next_host_placement_id;
                     host_state.next_host_placement_id += 1;

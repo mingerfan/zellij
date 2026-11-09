@@ -980,6 +980,9 @@ pub struct Grid {
     kitty_parser: KittyCommandParser,
     kitty_host_support: KittyHostSupport,
     sixel_host_support: bool,
+    /// Associate at most three coordinate marks with the just-printed
+    /// placeholder, before the ordinary combining-character path runs.
+    pending_kitty_placeholder: Option<(usize, usize, u8)>,
     pub changed_colors: Option<[Option<AnsiCode>; 256]>,
     pub should_render: bool,
     pub change_counter: u64,
@@ -1061,6 +1064,17 @@ pub struct Grid {
     pub osc7_payload: Option<String>,
     pub shell_reports: crate::attention::signals::ShellReportState,
     unseen_output_mark: Option<(usize, usize)>,
+}
+
+/// One horizontal run of adjacent, same-(image, placement, row) placeholder
+/// cells found in the viewport - see `Grid::scan_placeholder_runs`.
+struct PlaceholderRun {
+    start_x: usize,
+    length: usize,
+    image_id: u32,
+    placement_id: u32,
+    image_row: u32,
+    start_column: u32,
 }
 
 impl Grid {
@@ -1412,6 +1426,7 @@ impl Grid {
             kitty_parser: KittyCommandParser::new(),
             kitty_host_support: KittyHostSupport::Supported,
             sixel_host_support: true,
+            pending_kitty_placeholder: None,
             pending_clipboard_update: None,
             pending_osc7_cwd: None,
             pending_prompt_return: false,
@@ -1878,6 +1893,7 @@ impl Grid {
             return;
         }
         self.invalidate_scroll_offset();
+        self.pending_kitty_placeholder = None;
         if self.alternate_screen_state.is_some() {
             // in alternate screen we do nothing but log the new size, the program in the terminal
             // is in control now...
@@ -2242,13 +2258,14 @@ impl Grid {
         if self.kitty_settle_placements_below_the_viewport() {
             self.kitty_reanchor_all_from_pixels();
         }
-        let kitty_image_chunks = self.kitty_grid.viewport_kitty_chunks(
+        let mut kitty_image_chunks = self.kitty_grid.viewport_kitty_chunks(
             self.height,
             self.lines_above.len(),
             self.width,
             x_offset,
             y_offset,
         );
+        kitty_image_chunks.extend(self.placeholder_kitty_chunks(x_offset, y_offset));
         self.output_buffer.clear();
 
         (
@@ -2256,6 +2273,243 @@ impl Grid {
             changed_sixel_image_chunks,
             kitty_image_chunks,
         )
+    }
+    /// Scan the visible viewport for kitty Unicode-placeholder cells
+    /// and emit one image chunk per horizontal run. Each cell selects
+    /// an image via its fg color and optional high-byte mark, a placement
+    /// via its underline color, and image coordinates via attached marks. The scan is stateless: whatever cells are
+    /// on screen right now define what is drawn, so scrolling,
+    /// erasing and overwriting placeholder cells need no extra
+    /// lifecycle tracking.
+    fn placeholder_kitty_chunks(
+        &mut self,
+        x_offset: usize,
+        y_offset: usize,
+    ) -> Vec<KittyImageChunk> {
+        if !self.kitty_grid.has_virtual_placements() {
+            return vec![];
+        }
+        let cell = match *self.character_cell_size.borrow() {
+            Some(cell) => cell,
+            None => return vec![],
+        };
+        let store = self.kitty_grid.kitty_image_store.clone();
+        self.scan_placeholder_runs()
+            .into_iter()
+            .filter_map(|(y, run)| {
+                self.resolve_placeholder_run_chunk(&store, cell, x_offset, y_offset, y, run)
+            })
+            .collect()
+    }
+    /// Walk the visible viewport decoding placeholder cells back into
+    /// (image, placement, image-row/column) triples, and merge
+    /// horizontally-adjacent cells that belong to the same image row into
+    /// a single run - one run becomes one [`KittyImageChunk`].
+    fn scan_placeholder_runs(&self) -> Vec<(usize, PlaceholderRun)> {
+        fn color_bits(color: Option<AnsiCode>) -> Option<u32> {
+            match color {
+                Some(AnsiCode::RgbCode((r, g, b))) => {
+                    Some(((r as u32) << 16) | ((g as u32) << 8) | b as u32)
+                },
+                Some(AnsiCode::ColorIndex(index)) => Some(index as u32),
+                _ => None,
+            }
+        }
+        let mut runs: Vec<(usize, PlaceholderRun)> = vec![]; // (viewport_y, run)
+        for (y, row) in self.viewport.iter().enumerate().take(self.height) {
+            let mut current: Option<PlaceholderRun> = None;
+            let mut previous: Option<(
+                Option<AnsiCode>,
+                Option<AnsiCode>,
+                crate::panes::kitty_graphics::PlaceholderCell,
+            )> = None;
+            let mut x = 0;
+            for character in row.columns.iter() {
+                if x >= self.width {
+                    break;
+                }
+                let inherited = previous
+                    .filter(|(fg, underline, _)| {
+                        *fg == character.styles.foreground
+                            && *underline == character.styles.underline_color
+                    })
+                    .map(|(_, _, cell)| cell);
+                let placeholder =
+                    crate::panes::kitty_graphics::decode_placeholder(character, inherited);
+                previous = placeholder.map(|cell| {
+                    (
+                        character.styles.foreground,
+                        character.styles.underline_color,
+                        cell,
+                    )
+                });
+                let decoded = placeholder.and_then(|placeholder| {
+                    let id_low = color_bits(character.styles.foreground)?;
+                    let image_id = ((placeholder.image_id_msb as u32) << 24) | id_low;
+                    let placement_id = color_bits(character.styles.underline_color)
+                        .unwrap_or(crate::panes::kitty_graphics::NO_PLACEMENT_ID);
+                    Some((image_id, placement_id, placeholder))
+                });
+                match decoded {
+                    Some((image_id, placement_id, placeholder)) => match current.as_mut() {
+                        Some(run)
+                            if run.image_id == image_id
+                                && run.placement_id == placement_id
+                                && run.image_row == placeholder.image_row as u32
+                                && run.start_column + run.length as u32
+                                    == placeholder.image_column as u32 =>
+                        {
+                            run.length += 1;
+                        },
+                        _ => {
+                            if let Some(run) = current.take() {
+                                runs.push((y, run));
+                            }
+                            current = Some(PlaceholderRun {
+                                start_x: x,
+                                length: 1,
+                                image_id,
+                                placement_id,
+                                image_row: placeholder.image_row as u32,
+                                start_column: placeholder.image_column as u32,
+                            });
+                        },
+                    },
+                    None => {
+                        if let Some(run) = current.take() {
+                            runs.push((y, run));
+                        }
+                    },
+                }
+                x += character.width();
+            }
+            if let Some(run) = current.take() {
+                runs.push((y, run));
+            }
+        }
+        runs
+    }
+    /// Resolve one placeholder run's target placement and geometry, make
+    /// sure a scaled image variant exists for it, and emit the chunk that
+    /// paints it. Returns `None` for runs whose placement/image has since
+    /// disappeared, or that fall outside the placement's current bounds
+    /// (eg. after the placement was re-registered smaller).
+    fn resolve_placeholder_run_chunk(
+        &self,
+        store: &Rc<RefCell<KittyImageStore>>,
+        cell: SizeInPixels,
+        x_offset: usize,
+        y_offset: usize,
+        y: usize,
+        run: PlaceholderRun,
+    ) -> Option<KittyImageChunk> {
+        use crate::panes::kitty_graphics::grid_state::fit_rgba_into_box;
+        let placement = self
+            .kitty_grid
+            .virtual_placement(run.image_id, run.placement_id)?;
+        let (image_width, image_height) = {
+            let store = store.borrow();
+            let image = store.get(placement.internal_id)?;
+            (image.width as usize, image.height as usize)
+        };
+        if image_width == 0 || image_height == 0 {
+            return None;
+        }
+        if cell.width == 0 || cell.height == 0 {
+            return None;
+        }
+        // Derive omitted dimensions using checked integer arithmetic. Geometry
+        // is untrusted protocol input, including when only one axis is given.
+        let (columns, rows) = match (placement.columns as usize, placement.rows as usize) {
+            (0, 0) => (
+                image_width.div_ceil(cell.width),
+                image_height.div_ceil(cell.height),
+            ),
+            (columns, 0) => {
+                let numerator = (columns as u128)
+                    .checked_mul(cell.width as u128)?
+                    .checked_mul(image_height as u128)?;
+                let denominator = (image_width as u128).checked_mul(cell.height as u128)?;
+                (
+                    columns,
+                    usize::try_from(numerator.div_ceil(denominator))
+                        .ok()?
+                        .max(1),
+                )
+            },
+            (0, rows) => {
+                let numerator = (rows as u128)
+                    .checked_mul(cell.height as u128)?
+                    .checked_mul(image_width as u128)?;
+                let denominator = (image_height as u128).checked_mul(cell.width as u128)?;
+                (
+                    usize::try_from(numerator.div_ceil(denominator))
+                        .ok()?
+                        .max(1),
+                    rows,
+                )
+            },
+            (columns, rows) => (columns, rows),
+        };
+        if run.image_row as usize >= rows || run.start_column as usize >= columns {
+            return None;
+        }
+        let scaled_width = columns.checked_mul(cell.width)?;
+        let scaled_height = rows.checked_mul(cell.height)?;
+        let byte_len = scaled_width.checked_mul(scaled_height)?.checked_mul(4)?;
+        let key = crate::panes::kitty_graphics::ScaledImageKey {
+            source: PixelRect::new(0, 0, image_width, image_height),
+            size: (scaled_width, scaled_height),
+            fit: true,
+        };
+        let needs_variant = store
+            .borrow()
+            .scaled_variant(placement.internal_id, key)
+            .is_none();
+        if needs_variant {
+            // Check the shared quota BEFORE allocating or resampling pixels.
+            if !store
+                .borrow_mut()
+                .reserve_scaled_variant(placement.internal_id, key, byte_len)
+            {
+                return None;
+            }
+            let fitted = {
+                let store = store.borrow();
+                let image = store.get(placement.internal_id)?;
+                fit_rgba_into_box(
+                    &image.rgba,
+                    image_width,
+                    image_height,
+                    scaled_width,
+                    scaled_height,
+                )
+            };
+            store
+                .borrow_mut()
+                .add_scaled_variant(placement.internal_id, key, fitted);
+        }
+        let visible_columns = run
+            .length
+            .min(columns.saturating_sub(run.start_column as usize))
+            .min(self.width.saturating_sub(run.start_x));
+        if visible_columns == 0 {
+            return None;
+        }
+        Some(KittyImageChunk {
+            cell_x: x_offset + run.start_x,
+            cell_y: y_offset + y,
+            internal_image_id: placement.internal_id,
+            source_px_x: run.start_column as usize * cell.width,
+            source_px_y: run.image_row as usize * cell.height,
+            source_px_width: visible_columns * cell.width,
+            source_px_height: cell.height,
+            cell_offset_x: 0,
+            cell_offset_y: 0,
+            z_index: 0,
+            scaled_image: Some(key),
+            placement_uid: placement.placement_uid,
+        })
     }
     pub fn serialize(&self, scrollback_lines_to_serialize: Option<usize>) -> Option<String> {
         match scrollback_lines_to_serialize {
@@ -2747,6 +3001,7 @@ impl Grid {
     }
     pub fn move_cursor_to_beginning_of_line(&mut self) {
         self.cursor.x = 0;
+        self.pending_kitty_placeholder = None;
     }
     pub fn add_character_at_cursor_position(
         &mut self,
@@ -2814,7 +3069,10 @@ impl Grid {
     #[inline]
     fn add_fresh_character(&mut self, terminal_character: TerminalCharacter, may_group: bool) {
         let character_width = terminal_character.width();
+        // Placeholder diacritics belong to the image coordinates rather than
+        // to the grapheme text attached to the preceding terminal cell.
         if character_width == 0 {
+            self.apply_kitty_placeholder_diacritic(terminal_character.character);
             return;
         }
         if character_width > self.width {
@@ -2826,6 +3084,8 @@ impl Grid {
             }
             self.line_wrap();
         }
+        let is_kitty_placeholder =
+            terminal_character.character == crate::panes::kitty_graphics::PLACEHOLDER_CHAR;
         self.add_character_at_cursor_position(terminal_character, false);
         if may_group {
             if let Some(row) = self.viewport.get_mut(self.cursor.y) {
@@ -2833,6 +3093,48 @@ impl Grid {
             }
         }
         self.move_cursor_forward_until_edge(character_width);
+        self.pending_kitty_placeholder = if is_kitty_placeholder {
+            Some((self.cursor.x.saturating_sub(1), self.cursor.y, 0))
+        } else {
+            None
+        };
+    }
+    /// Keep the protocol's coordinate marks attached to their placeholder.
+    /// Other terminal text continues to use the normal grapheme machinery.
+    fn apply_kitty_placeholder_diacritic(&mut self, character: char) {
+        let (x, y, marks_seen) = match self.pending_kitty_placeholder {
+            Some(pending) => pending,
+            None => return,
+        };
+        if self.cursor.y != y || self.cursor.x != x + 1 || marks_seen > 2 {
+            self.pending_kitty_placeholder = None;
+            return;
+        }
+        if crate::panes::kitty_graphics::diacritic_index(character).is_none() {
+            self.pending_kitty_placeholder = None;
+            return;
+        }
+        let absolute_x = match self.get_absolute_character_index(x, y) {
+            Some(absolute_x) => absolute_x,
+            None => {
+                self.pending_kitty_placeholder = None;
+                return;
+            },
+        };
+        if let Some(cell) = self
+            .viewport
+            .get_mut(y)
+            .and_then(|row| row.columns.get_mut(absolute_x))
+        {
+            if cell.character == crate::panes::kitty_graphics::PLACEHOLDER_CHAR
+                && cell.attach(character)
+            {
+                self.output_buffer.update_line(y);
+                self.pending_kitty_placeholder = Some((x, y, marks_seen + 1));
+                return;
+            }
+        }
+        self.pending_kitty_placeholder = None;
     }
     fn attach_target_column(&self) -> Option<usize> {
         if self.cursor.x >= self.width {
@@ -2957,6 +3259,7 @@ impl Grid {
     pub fn move_cursor_forward_until_edge(&mut self, count: usize) {
         let count_to_move = std::cmp::min(count, self.width.saturating_sub(self.cursor.x));
         self.cursor.x += count_to_move;
+        self.pending_kitty_placeholder = None;
     }
     pub fn replace_characters_in_line_after_cursor(&mut self, replace_with: TerminalCharacter) {
         if let Some(row) = self.viewport.get_mut(self.cursor.y) {
@@ -3080,8 +3383,10 @@ impl Grid {
         }
         self.pad_lines_until(self.cursor.y, pad_character.clone());
         self.pad_current_line_until(self.cursor.x, pad_character);
+        self.pending_kitty_placeholder = None;
     }
     pub fn move_cursor_up(&mut self, count: usize) {
+        self.pending_kitty_placeholder = None;
         let (scroll_region_top, scroll_region_bottom) = self.scroll_region;
         if self.cursor.y >= scroll_region_top && self.cursor.y <= scroll_region_bottom {
             self.cursor.y = std::cmp::max(self.cursor.y.saturating_sub(count), scroll_region_top);
@@ -3118,6 +3423,7 @@ impl Grid {
         count: usize,
         pad_character: TerminalCharacter,
     ) {
+        self.pending_kitty_placeholder = None;
         let (scroll_region_top, scroll_region_bottom) = self.scroll_region;
         if self.cursor.y >= scroll_region_top && self.cursor.y <= scroll_region_bottom {
             self.cursor.y = std::cmp::min(self.cursor.y + count, scroll_region_bottom);
@@ -3127,6 +3433,7 @@ impl Grid {
         self.pad_lines_until(self.cursor.y, pad_character);
     }
     pub fn move_cursor_back(&mut self, count: usize) {
+        self.pending_kitty_placeholder = None;
         if self.cursor.x == self.width {
             // on the rightmost screen edge, backspace skips one character
             self.cursor.x -= 1;
@@ -3204,12 +3511,14 @@ impl Grid {
         self.cursor.x = column;
         let pad_character = EMPTY_TERMINAL_CHARACTER;
         self.pad_current_line_until(self.cursor.x, pad_character);
+        self.pending_kitty_placeholder = None;
     }
     pub fn move_cursor_to_line(&mut self, line: usize, pad_character: TerminalCharacter) {
         self.cursor.y = std::cmp::min(self.height - 1, line);
         self.pad_lines_until(self.cursor.y, pad_character);
         let pad_character = EMPTY_TERMINAL_CHARACTER;
         self.pad_current_line_until(self.cursor.x, pad_character);
+        self.pending_kitty_placeholder = None;
     }
     pub fn replace_with_empty_chars(&mut self, count: usize, empty_char_style: RcCharacterStyles) {
         let mut empty_character = EMPTY_TERMINAL_CHARACTER;
@@ -3784,7 +4093,14 @@ impl Grid {
             for terminal_character in &row.columns {
                 let character_end = terminal_col + terminal_character.width();
                 if terminal_col < end_column && character_end > start_column {
-                    terminal_character.push_text_to(&mut line_selection);
+                    // Images have no textual content to copy.
+                    if crate::panes::kitty_graphics::is_placeholder_character(
+                        terminal_character.character,
+                    ) {
+                        line_selection.push(' ');
+                    } else {
+                        terminal_character.push_text_to(&mut line_selection);
+                    }
                 }
 
                 terminal_col = character_end;
@@ -4338,6 +4654,7 @@ impl Grid {
         self.kitty_reanchor_all_from_pixels();
     }
     fn move_cursor_down_by_pixels(&mut self, pixel_count: usize) {
+        self.pending_kitty_placeholder = None;
         if let Some(character_cell_size) = {
             let c = *self.character_cell_size.borrow();
             c
@@ -4410,7 +4727,38 @@ impl Grid {
         let (result, was_query) = match parsed {
             Ok(command) => {
                 let was_query = command.action == KittyAction::Query;
-                (self.execute_kitty_command(command), was_query)
+                // U=1 marks a virtual placement: the image has no
+                // position of its own. The placeholder cells the app
+                // prints are the placement, and the render pass paints
+                // matching image fragments wherever those cells are.
+                // Both protocol forms are supported: transmit-and-place
+                // in one command (a=T/a=t with U=1 and a payload), and
+                // placing an already-transmitted image (a=p with U=1).
+                if command.unicode_placeholder {
+                    let result = match command.action {
+                        KittyAction::Transmit | KittyAction::TransmitAndDisplay => {
+                            Some(self.kitty_grid.register_virtual_transmit(&command))
+                        },
+                        KittyAction::Display => {
+                            Some(self.kitty_grid.register_virtual_display(&command))
+                        },
+                        // Query/Delete/Animate and friends don't register or
+                        // move a placement, so U=1 has nothing to change
+                        // about how they run: fall through to the normal
+                        // command path rather than adding a case for each.
+                        _ => None,
+                    };
+                    if let Some(result) = result {
+                        if result.is_ok() {
+                            self.mark_for_rerender();
+                        }
+                        (result, was_query)
+                    } else {
+                        (self.execute_kitty_command(command), was_query)
+                    }
+                } else {
+                    (self.execute_kitty_command(command), was_query)
+                }
             },
             Err(e) => (Err(e), false),
         };
@@ -5254,6 +5602,7 @@ impl Grid {
         }
         self.output_buffer.update_line(y);
         self.cursor.x = x + 2 * count;
+        self.pending_kitty_placeholder = None;
         consumed
     }
 
@@ -5301,6 +5650,7 @@ impl Grid {
         }
         self.output_buffer.update_line(y);
         self.cursor.x = x + count;
+        self.pending_kitty_placeholder = None;
         count
     }
 }
@@ -5351,6 +5701,10 @@ impl Handler for Grid {
     fn print(&mut self, c: char) {
         let c = self.cursor.charsets[self.active_charset].map(c);
         let (width, may_group) = grapheme_join::width_and_may_group(c);
+        if width == 0 && self.pending_kitty_placeholder.is_some() {
+            self.apply_kitty_placeholder_diacritic(c);
+            return;
+        }
         if width == 0 && ((c as u32) >= 0x300 || c == '\u{AD}') {
             self.attach_code_point(c);
             return;
@@ -5971,7 +6325,8 @@ impl Handler for Grid {
                     if let Some(images_to_reap) = self.sixel_grid.clear() {
                         self.sixel_grid.reap_images(images_to_reap);
                     }
-                    self.kitty_grid.clear_all_placements();
+                    // ED3 does not erase visible placeholder characters.
+                    self.kitty_grid.clear_positioned_placements();
                 }
             };
         } else if c == 'H' || c == 'f' {
@@ -6036,6 +6391,7 @@ impl Handler for Grid {
                             );
                             self.invalidate_scroll_offset();
                             self.clear_viewport_before_rendering = true;
+                            self.pending_kitty_placeholder = None;
                             self.force_change_size(self.height, self.width); // the alternative_viewport might have been of a different size...
                             self.mark_for_rerender();
                         },
@@ -6123,6 +6479,7 @@ impl Handler for Grid {
                         },
                         1049 => {
                             // enter alternate buffer
+                            self.pending_kitty_placeholder = None;
                             let current_lines_above =
                                 std::mem::replace(&mut self.lines_above, VecDeque::new());
                             let current_viewport = std::mem::replace(

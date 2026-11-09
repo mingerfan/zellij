@@ -101,6 +101,7 @@ fn byte_accounting_matches_hand_computed_total_with_scaled_variants() {
     let first = super::ScaledImageKey {
         source: crate::panes::sixel::PixelRect::new(0, 0, 10, 10),
         size: (3, 2),
+        fit: false,
     };
     let second = super::ScaledImageKey {
         size: (5, 4),
@@ -145,6 +146,7 @@ fn scaled_variant_reservation_respects_quota_when_images_are_pinned() {
     let key = super::ScaledImageKey {
         source: crate::panes::sixel::PixelRect::new(0, 0, 10, 10),
         size: (12, 12),
+        fit: false,
     };
     assert!(store.reserve_scaled_variant(id_a, key, 576));
     assert!(!store.reserve_scaled_variant(id_a, key, 700));

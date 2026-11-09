@@ -14,6 +14,8 @@ pub type InternalImageId = u64;
 pub struct ScaledImageKey {
     pub source: PixelRect,
     pub size: (usize, usize),
+    /// Preserve aspect ratio and letterbox, rather than stretch the source.
+    pub fit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
